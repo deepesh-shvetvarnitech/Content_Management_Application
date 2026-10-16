@@ -29,6 +29,8 @@ from app.schemas.user import (
     LogoutRequest,
     UserProfileCreate,
     UserProfileResponse,
+    UserUpdate,
+    UserMeResponse,
 )
 from app.services.user_service import register_user, authenticate_user
 
@@ -389,3 +391,76 @@ def update_profile(
         raise
 
     return profile
+
+@router.get("/me", response_model=UserMeResponse)
+def get_my_account(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = db.scalar(
+        select(UserProfile).where(UserProfile.user_id == current_user.id)
+    )
+    return {
+        "id": current_user.id,
+        "name": current_user.name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "is_active": current_user.is_active,
+        "created_at": current_user.created_at,
+        "bio": profile.bio if profile else None,
+        "profile_image_url": profile.profile_picture if profile else None,
+    }
+
+
+@router.put("/me", response_model=UserMeResponse)
+def update_my_account(
+    payload: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide at least one field to update",
+        )
+
+    if "name" in changes:
+        if changes["name"] is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Name cannot be null",
+            )
+        current_user.name = changes["name"]
+
+    profile_fields = {
+        "bio": changes.get("bio"),
+        "profile_picture": changes.get("profile_image_url"),
+    }
+    fields_provided = (
+        "bio" in changes or "profile_image_url" in changes
+    )
+
+    if fields_provided:
+        profile = db.scalar(
+            select(UserProfile).where(
+                UserProfile.user_id == current_user.id
+            )
+        )
+        if profile is None:
+            profile = UserProfile(user_id=current_user.id)
+            db.add(profile)
+
+        if "bio" in changes:
+            profile.bio = profile_fields["bio"]
+        if "profile_image_url" in changes:
+            profile.profile_picture = profile_fields["profile_picture"]
+
+    try:
+        db.commit()
+        db.refresh(current_user)
+    except Exception:
+        db.rollback()
+        raise
+
+    return get_my_account(current_user=current_user, db=db)

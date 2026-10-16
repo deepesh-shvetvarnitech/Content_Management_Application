@@ -30,6 +30,10 @@ class User(Base):
         nullable=False,
     )
 
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
