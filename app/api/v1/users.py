@@ -1,6 +1,7 @@
 
 
 import jwt
+from itsdangerous import BadSignature, SignatureExpired
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -10,6 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.email_verification import verify_email_token
+from app.tasks.email_tasks import send_verification_email
 from app.core.redis_client import redis_client
 from app.core.security import (
     create_access_token,
@@ -149,7 +152,22 @@ def create_user(
 ):
     try:
         # Public registration never accepts a role from the request.
-        return register_user(db, user_data)
+        user = register_user(db, user_data)
+
+        # Queue verification email without turning a broker error
+        # into a misleading registration failure.
+        try:
+            send_verification_email.delay(
+                user.id, user.email, user.name
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Could not queue verification email for user_id=%s",
+                user.id,
+            )
+
+        return user
     except ValueError as exc:
         db.rollback()
         raise HTTPException(
@@ -164,6 +182,44 @@ def create_user(
         ) from exc
 
 
+@router.get("/verify-email")
+def verify_email(
+    token: str,
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = verify_email_token(token)
+        user_id = int(payload["user_id"])
+        email = str(payload["email"]).lower()
+    except SignatureExpired as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification link has expired. Request a new email.",
+        ) from exc
+    except (BadSignature, ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification link",
+        ) from exc
+
+    user = db.get(User, user_id)
+    if user is None or user.email.lower() != email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification link",
+        )
+
+    if not user.email_verified:
+        user.email_verified = True
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    return {"message": "Email verified successfully"}
+
+
 @router.post("/login", response_model=TokenResponse)
 def login(
     credentials: UserLogin,
@@ -176,6 +232,12 @@ def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your email before logging in",
         )
 
     access_token = create_access_token(str(user.id))
