@@ -1,10 +1,11 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.v1.users import get_current_user
+from app.dependencies.auth import get_current_user
 from app.db.session import get_db
 from app.models.blog import Blog
+from app.core.exceptions.custom_exceptions import BlogNotFoundException, CommentNotFoundException, ForbiddenException
 from app.models.comment import Comment
 from app.models.user import User
 from app.schemas.comment import (
@@ -20,10 +21,7 @@ def get_published_blog(blog_id: int, db: Session) -> Blog:
     blog = db.get(Blog, blog_id)
 
     if blog is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Blog not found",
-        )
+        raise BlogNotFoundException()
 
     if not blog.is_published:
         raise HTTPException(
@@ -102,16 +100,10 @@ def update_comment(
     comment = db.get(Comment, comment_id)
 
     if comment is None or comment.blog_id != blog_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Comment not found",
-        )
+        raise CommentNotFoundException()
 
     if comment.user_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot edit another user's comment",
-        )
+        raise ForbiddenException("You cannot edit another user comment")
 
     content = payload.content.strip()
     if not content:
@@ -139,16 +131,10 @@ def delete_comment(
     comment = db.get(Comment, comment_id)
 
     if comment is None or comment.blog_id != blog_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Comment not found",
-        )
+        raise CommentNotFoundException()
 
     if current_user.role != "admin" and comment.user_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot delete another user's comment",
-        )
+        raise ForbiddenException("You cannot delete another user comment")
 
     db.delete(comment)
     db.commit()

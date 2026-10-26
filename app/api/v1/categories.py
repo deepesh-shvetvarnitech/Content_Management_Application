@@ -1,11 +1,15 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.core.exceptions.custom_exceptions import (
+    CategoryNotFoundException,
+    ResourceConflictException,
+)
 from app.models.category import Category
 from app.schemas.category import CategoryCreate, CategoryUpdate, CategoryResponse
-from app.api.v1.users import require_admin
+from app.dependencies.permissions import require_admin
 
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
@@ -24,7 +28,7 @@ def create_category(
 ):
     existing = db.scalar(select(Category).where(Category.name == data.name))
     if existing:
-        raise HTTPException(status_code=409, detail="Category already exists")
+        raise ResourceConflictException("Category already exists", "CATEGORY_ALREADY_EXISTS")
 
     category = Category(
         name=data.name,
@@ -45,7 +49,7 @@ def list_categories(db: Session = Depends(get_db)):
 def get_category(category_id: int, db: Session = Depends(get_db)):
     category = db.get(Category, category_id)
     if category is None:
-        raise HTTPException(status_code=404, detail="Category not found")
+        raise CategoryNotFoundException()
     return category
 
 
@@ -58,7 +62,7 @@ def update_category(
 ):
     category = db.get(Category, category_id)
     if category is None:
-        raise HTTPException(status_code=404, detail="Category not found")
+        raise CategoryNotFoundException()
 
     changes = data.model_dump(exclude_unset=True)
 
@@ -71,10 +75,7 @@ def update_category(
                 select(Category).where(Category.name == changes["name"])
             )
             if existing:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Category name already exists",
-                )
+                raise ResourceConflictException("Category name already exists", "CATEGORY_ALREADY_EXISTS")
 
     for field, value in changes.items():
         setattr(category, field, value)
@@ -92,13 +93,10 @@ def delete_category(
 ):
     category = db.get(Category, category_id)
     if category is None:
-        raise HTTPException(status_code=404, detail="Category not found")
+        raise CategoryNotFoundException()
 
     if category.blogs:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot delete a category that has blogs",
-        )
+        raise ResourceConflictException("Cannot delete a category that has blogs", "CATEGORY_HAS_BLOGS")
 
     db.delete(category)
     db.commit()

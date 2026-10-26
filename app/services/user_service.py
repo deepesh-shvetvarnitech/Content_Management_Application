@@ -3,6 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, verify_password
+from app.core.exceptions.custom_exceptions import UserAlreadyExistsException
 from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin
 
@@ -15,7 +16,7 @@ def register_user(db: Session, user_data: UserCreate) -> User:
     )
 
     if existing_user:
-        raise ValueError("Email is already registered")
+        raise UserAlreadyExistsException()
 
     user = User(
         name=user_data.name,

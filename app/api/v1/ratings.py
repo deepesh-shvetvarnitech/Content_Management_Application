@@ -3,9 +3,10 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.v1.users import get_current_user
+from app.dependencies.auth import get_current_user
 from app.db.session import get_db
 from app.models.blog import Blog
+from app.core.exceptions.custom_exceptions import BlogNotFoundException, ResourceNotFoundException, ResourceConflictException
 from app.models.rating import Rating
 from app.models.user import User
 from app.schemas.rating import (
@@ -22,7 +23,7 @@ def get_published_blog(blog_id: int, db: Session) -> Blog:
     blog = db.get(Blog, blog_id)
 
     if blog is None:
-        raise HTTPException(status_code=404, detail="Blog not found")
+        raise BlogNotFoundException()
 
     if not blog.is_published:
         raise HTTPException(
@@ -54,10 +55,7 @@ def create_rating(
     )
 
     if existing:
-        raise HTTPException(
-            status_code=409,
-            detail="You have already rated this blog; update your rating instead",
-        )
+        raise ResourceConflictException("You have already rated this blog; update your rating instead", "RATING_ALREADY_EXISTS")
 
     rating = Rating(
         blog_id=blog_id,
@@ -70,10 +68,7 @@ def create_rating(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="You have already rated this blog",
-        )
+        raise ResourceConflictException("You have already rated this blog", "RATING_ALREADY_EXISTS")
 
     db.refresh(rating)
     return rating
@@ -121,7 +116,7 @@ def my_rating(
     )
 
     if rating is None:
-        raise HTTPException(status_code=404, detail="You have not rated this blog")
+        raise ResourceNotFoundException("You have not rated this blog", "RATING_NOT_FOUND")
 
     return rating
 
@@ -146,7 +141,7 @@ def update_my_rating(
     )
 
     if rating is None:
-        raise HTTPException(status_code=404, detail="You have not rated this blog")
+        raise ResourceNotFoundException("You have not rated this blog", "RATING_NOT_FOUND")
 
     rating.value = payload.value
     db.commit()
@@ -171,7 +166,7 @@ def delete_my_rating(
     )
 
     if rating is None:
-        raise HTTPException(status_code=404, detail="You have not rated this blog")
+        raise ResourceNotFoundException("You have not rated this blog", "RATING_NOT_FOUND")
 
     db.delete(rating)
     db.commit()

@@ -36,6 +36,13 @@ from app.schemas.user import (
     UserMeResponse,
 )
 from app.services.user_service import register_user, authenticate_user
+from app.core.exceptions.custom_exceptions import (
+    UserAlreadyExistsException,
+    InvalidCredentialsException,
+    UserNotVerifiedException,
+    UserInactiveException,
+    ForbiddenException,
+)
 
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -116,15 +123,12 @@ def get_current_user(
     return user
 
 
-# RBAC: Admin authorization dependency
+
 def require_admin(
     current_user: User = Depends(get_current_user),
 ) -> User:
     if current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required",
-        )
+        raise ForbiddenException("Admin access required")
 
     return current_user
 
@@ -151,16 +155,25 @@ def create_user(
     db: Session = Depends(get_db),
 ):
     try:
-        # Public registration never accepts a role from the request.
+        
         user = register_user(db, user_data)
-        send_verification_email.delay(user.id, user.email, user.name)
+
+        
+        try:
+            send_verification_email.delay(
+                user.id, user.email, user.name
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Could not queue verification email for user_id=%s",
+                user.id,
+            )
+
         return user
-    except ValueError as exc:
+    except UserAlreadyExistsException:
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
-        ) from exc
+        raise
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(
@@ -215,17 +228,10 @@ def login(
     user = authenticate_user(db, credentials)
 
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise InvalidCredentialsException()
 
     if not user.email_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Please verify your email before logging in",
-        )
+        raise UserNotVerifiedException()
 
     access_token = create_access_token(str(user.id))
     refresh_token = create_refresh_token(str(user.id))

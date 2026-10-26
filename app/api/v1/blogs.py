@@ -1,9 +1,15 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.api.v1.users import get_current_user, require_admin
+from app.dependencies.auth import get_current_user
+from app.dependencies.permissions import require_admin
 from app.db.session import get_db
+from app.core.exceptions.custom_exceptions import (
+    BlogNotFoundException,
+    CategoryNotFoundException,
+    ForbiddenException,
+)
 from app.models.blog import Blog
 from app.models.category import Category
 from app.models.user import User
@@ -25,7 +31,7 @@ def create_blog(
 ):
     category = db.get(Category, payload.category_id)
     if category is None:
-        raise HTTPException(status_code=404, detail="Category not found")
+        raise CategoryNotFoundException()
 
     blog = Blog(
         title=payload.title,
@@ -85,14 +91,14 @@ def get_blog(
 ):
     blog = db.get(Blog, blog_id)
     if blog is None:
-        raise HTTPException(status_code=404, detail="Blog not found")
+        raise BlogNotFoundException()
 
     if (
         not blog.is_published
         and current_user.role != "admin"
         and blog.author_id != current_user.id
     ):
-        raise HTTPException(status_code=403, detail="Access denied")
+        raise ForbiddenException("Access denied")
 
     return blog
 
@@ -106,16 +112,16 @@ def update_blog(
 ):
     blog = db.get(Blog, blog_id)
     if blog is None:
-        raise HTTPException(status_code=404, detail="Blog not found")
+        raise BlogNotFoundException()
 
     if current_user.role != "admin" and blog.author_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You cannot edit this blog")
+        raise ForbiddenException("You cannot edit this blog")
 
     changes = payload.model_dump(exclude_unset=True)
     if "category_id" in changes:
         category = db.get(Category, changes["category_id"])
         if category is None:
-            raise HTTPException(status_code=404, detail="Category not found")
+            raise CategoryNotFoundException()
 
     for field, value in changes.items():
         setattr(blog, field, value)
@@ -134,7 +140,7 @@ def set_blog_published(
 ):
     blog = db.get(Blog, blog_id)
     if blog is None:
-        raise HTTPException(status_code=404, detail="Blog not found")
+        raise BlogNotFoundException()
 
     blog.is_published = payload.is_published
     db.commit()
@@ -150,7 +156,7 @@ def delete_blog(
 ):
     blog = db.get(Blog, blog_id)
     if blog is None:
-        raise HTTPException(status_code=404, detail="Blog not found")
+        raise BlogNotFoundException()
 
     db.delete(blog)
     db.commit()

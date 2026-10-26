@@ -1,132 +1,42 @@
 
 
-import jwt
 from itsdangerous import BadSignature, SignatureExpired
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from redis.exceptions import RedisError
+from fastapi.security import HTTPBearer
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from app.dependencies.auth import get_current_user
+from app.dependencies.permissions import require_admin
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
-from app.core.email_verification import verify_email_token
-from app.tasks.email_tasks import send_verification_email
-from app.core.redis_client import redis_client
-from app.core.security import (
-    create_access_token,
-    create_refresh_token,
-    decode_access_token,
-    decode_refresh_token,
-)
-from app.db.session import SessionLocal
+from app.db.session import get_db
 from app.models.user import User
 from app.models.user_profile import UserProfile
 from app.schemas.user import (
-    UserCreate,
-    UserResponse,
-    UserLogin,
-    TokenResponse,
-    RefreshTokenRequest,
-    LogoutRequest,
     UserProfileCreate,
     UserProfileResponse,
     UserUpdate,
     UserMeResponse,
 )
-from app.services.user_service import register_user, authenticate_user
 
 
 router = APIRouter(prefix="/users", tags=["Users"])
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-ROTATE_REFRESH_SCRIPT = """
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-    return 0
-end
-redis.call('DEL', KEYS[1])
-redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
-return 1
-"""
 
 
-LOGOUT_SCRIPT = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
-end
-return 0
-"""
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
-def session_key(jti: str) -> str:
-    return f"refresh:{jti}"
 
 
-def refresh_ttl() -> int:
-    return settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(
-        bearer_scheme
-    ),
-    db: Session = Depends(get_db),
-) -> User:
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login and provide a Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    try:
-        payload = decode_access_token(credentials.credentials)
-        user_id = int(payload["sub"])
-    except (
-        jwt.InvalidTokenError,
-        ValueError,
-        TypeError,
-        KeyError,
-    ) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired access token",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-
-    user = db.get(User, user_id)
-
-    if user is None or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found or inactive",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return user
 
 
-# RBAC: Admin authorization dependency
-def require_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    if current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required",
-        )
 
-    return current_user
 
 
 # RBAC: Admin-only test endpoint
@@ -141,220 +51,14 @@ def admin_check(
     }
 
 
-@router.post(
-    "/register",
-    response_model=UserResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_user(
-    user_data: UserCreate,
-    db: Session = Depends(get_db),
-):
-    try:
-        # Public registration never accepts a role from the request.
-        user = register_user(db, user_data)
-
-        # Queue verification email without turning a broker error
-        # into a misleading registration failure.
-        try:
-            send_verification_email.delay(
-                user.id, user.email, user.name
-            )
-        except Exception:
-            import logging
-            logging.getLogger(__name__).exception(
-                "Could not queue verification email for user_id=%s",
-                user.id,
-            )
-
-        return user
-    except ValueError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
-        ) from exc
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Email is already registered",
-        ) from exc
 
 
-@router.get("/verify-email")
-def verify_email(
-    token: str,
-    db: Session = Depends(get_db),
-):
-    try:
-        payload = verify_email_token(token)
-        user_id = int(payload["user_id"])
-        email = str(payload["email"]).lower()
-    except SignatureExpired as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Verification link has expired. Request a new email.",
-        ) from exc
-    except (BadSignature, ValueError, TypeError, KeyError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid verification link",
-        ) from exc
-
-    user = db.get(User, user_id)
-    if user is None or user.email.lower() != email:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid verification link",
-        )
-
-    if not user.email_verified:
-        user.email_verified = True
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-
-    return {"message": "Email verified successfully"}
 
 
-@router.post("/login", response_model=TokenResponse)
-def login(
-    credentials: UserLogin,
-    db: Session = Depends(get_db),
-):
-    user = authenticate_user(db, credentials)
-
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if not user.email_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Please verify your email before logging in",
-        )
-
-    access_token = create_access_token(str(user.id))
-    refresh_token = create_refresh_token(str(user.id))
-
-    try:
-        payload = decode_refresh_token(refresh_token)
-        redis_client.set(
-            session_key(payload["jti"]),
-            str(user.id),
-            ex=refresh_ttl(),
-        )
-    except (RedisError, jwt.InvalidTokenError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication session service is unavailable",
-        ) from exc
-
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-    }
 
 
-@router.post("/refresh", response_model=TokenResponse)
-def refresh_tokens(
-    body: RefreshTokenRequest,
-    db: Session = Depends(get_db),
-):
-    try:
-        payload = decode_refresh_token(body.refresh_token)
-        user_id = int(payload["sub"])
-        old_jti = payload["jti"]
-
-        user = db.get(User, user_id)
-        if user is None or not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found or inactive",
-            )
-
-        new_refresh = create_refresh_token(str(user_id))
-        new_payload = decode_refresh_token(new_refresh)
-
-        rotated = redis_client.eval(
-            ROTATE_REFRESH_SCRIPT,
-            2,
-            session_key(old_jti),
-            session_key(new_payload["jti"]),
-            str(user_id),
-            refresh_ttl(),
-        )
-
-        if rotated != 1:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token is invalid or already used",
-            )
-
-        return {
-            "access_token": create_access_token(str(user_id)),
-            "refresh_token": new_refresh,
-            "token_type": "bearer",
-        }
-
-    except HTTPException:
-        raise
-    except (
-        jwt.InvalidTokenError,
-        ValueError,
-        TypeError,
-        KeyError,
-    ) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
-        ) from exc
-    except RedisError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication session service is unavailable",
-        ) from exc
 
 
-@router.post("/logout")
-def logout(body: LogoutRequest):
-    try:
-        payload = decode_refresh_token(body.refresh_token)
-
-        revoked = redis_client.eval(
-            LOGOUT_SCRIPT,
-            1,
-            session_key(payload["jti"]),
-            str(payload["sub"]),
-        )
-
-        return {
-            "message": "Logged out successfully",
-            "revoked": bool(revoked),
-        }
-
-    except (
-        jwt.InvalidTokenError,
-        ValueError,
-        TypeError,
-        KeyError,
-    ) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
-        ) from exc
-    except RedisError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication session service is unavailable",
-        ) from exc
 
 
 @router.post(

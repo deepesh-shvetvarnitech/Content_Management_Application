@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.v1.users import get_db, require_admin
+from app.db.session import get_db
+from app.dependencies.permissions import require_admin
 from app.models.user import User
 from app.schemas.user import AdminUserResponse
 
