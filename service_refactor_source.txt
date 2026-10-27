@@ -1,0 +1,1147 @@
+﻿
+========== FILE: app\api\v1\auth.py ==========
+
+
+
+import jwt
+from itsdangerous import BadSignature, SignatureExpired
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from redis.exceptions import RedisError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.email_verification import verify_email_token
+from app.tasks.email_tasks import send_verification_email
+from app.core.redis_client import redis_client
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_access_token,
+    decode_refresh_token,
+)
+from app.db.session import SessionLocal
+from app.models.user import User
+from app.models.user_profile import UserProfile
+from app.schemas.user import (
+    UserCreate,
+    UserResponse,
+    UserLogin,
+    TokenResponse,
+    RefreshTokenRequest,
+    LogoutRequest,
+    UserProfileCreate,
+    UserProfileResponse,
+    UserUpdate,
+    UserMeResponse,
+)
+from app.services.user_service import register_user, authenticate_user
+from app.core.exceptions.custom_exceptions import (
+    UserAlreadyExistsException,
+    InvalidCredentialsException,
+    UserNotVerifiedException,
+    UserInactiveException,
+    ForbiddenException,
+)
+
+
+
+from app.db.session import get_db
+
+router = APIRouter(prefix="/users", tags=["Authentication"])
+
+
+ROTATE_REFRESH_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+
+LOGOUT_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def session_key(jti: str) -> str:
+    return f"refresh:{jti}"
+
+
+def refresh_ttl() -> int:
+    return settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
+
+
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_user(
+    user_data: UserCreate,
+    db: Session = Depends(get_db),
+):
+    try:
+        
+        user = register_user(db, user_data)
+
+        
+        try:
+            send_verification_email.delay(
+                user.id, user.email, user.name
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Could not queue verification email for user_id=%s",
+                user.id,
+            )
+
+        return user
+    except UserAlreadyExistsException:
+        db.rollback()
+        raise
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email is already registered",
+        ) from exc
+
+
+@router.get("/verify-email")
+def verify_email(
+    token: str,
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = verify_email_token(token)
+        user_id = int(payload["user_id"])
+        email = str(payload["email"]).lower()
+    except SignatureExpired as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification link has expired. Request a new email.",
+        ) from exc
+    except (BadSignature, ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification link",
+        ) from exc
+
+    user = db.get(User, user_id)
+    if user is None or user.email.lower() != email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification link",
+        )
+
+    if not user.email_verified:
+        user.email_verified = True
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    return {"message": "Email verified successfully"}
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(
+    credentials: UserLogin,
+    db: Session = Depends(get_db),
+):
+    user = authenticate_user(db, credentials)
+
+    if user is None:
+        raise InvalidCredentialsException()
+
+    if not user.email_verified:
+        raise UserNotVerifiedException()
+
+    access_token = create_access_token(str(user.id))
+    refresh_token = create_refresh_token(str(user.id))
+
+    try:
+        payload = decode_refresh_token(refresh_token)
+        redis_client.set(
+            session_key(payload["jti"]),
+            str(user.id),
+            ex=refresh_ttl(),
+        )
+    except (RedisError, jwt.InvalidTokenError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication session service is unavailable",
+        ) from exc
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh_tokens(
+    body: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = decode_refresh_token(body.refresh_token)
+        user_id = int(payload["sub"])
+        old_jti = payload["jti"]
+
+        user = db.get(User, user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found or inactive",
+            )
+
+        new_refresh = create_refresh_token(str(user_id))
+        new_payload = decode_refresh_token(new_refresh)
+
+        rotated = redis_client.eval(
+            ROTATE_REFRESH_SCRIPT,
+            2,
+            session_key(old_jti),
+            session_key(new_payload["jti"]),
+            str(user_id),
+            refresh_ttl(),
+        )
+
+        if rotated != 1:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token is invalid or already used",
+            )
+
+        return {
+            "access_token": create_access_token(str(user_id)),
+            "refresh_token": new_refresh,
+            "token_type": "bearer",
+        }
+
+    except HTTPException:
+        raise
+    except (
+        jwt.InvalidTokenError,
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        ) from exc
+    except RedisError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication session service is unavailable",
+        ) from exc
+
+
+@router.post("/logout")
+def logout(body: LogoutRequest):
+    try:
+        payload = decode_refresh_token(body.refresh_token)
+
+        revoked = redis_client.eval(
+            LOGOUT_SCRIPT,
+            1,
+            session_key(payload["jti"]),
+            str(payload["sub"]),
+        )
+
+        return {
+            "message": "Logged out successfully",
+            "revoked": bool(revoked),
+        }
+
+    except (
+        jwt.InvalidTokenError,
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        ) from exc
+    except RedisError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication session service is unavailable",
+        ) from exc
+
+
+
+========== FILE: app\core\security.py ==========
+
+
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+import jwt
+from pwdlib import PasswordHash
+
+from app.core.config import settings
+
+
+password_hash = PasswordHash.recommended()
+
+
+def hash_password(password: str) -> str:
+    return password_hash.hash(password)
+
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    return password_hash.verify(password, hashed_password)
+
+
+def _create_token(
+    subject: str,
+    token_type: str,
+    expires_delta: timedelta,
+) -> str:
+    now = datetime.now(timezone.utc)
+
+    payload = {
+        "sub": subject,
+        "type": token_type,
+        "iat": now,
+        "exp": now + expires_delta,
+        "jti": str(uuid4()),
+    }
+
+    return jwt.encode(
+        payload,
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def create_access_token(subject: str) -> str:
+    return _create_token(
+        subject,
+        "access",
+        timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+
+
+def create_refresh_token(subject: str) -> str:
+    return _create_token(
+        subject,
+        "refresh",
+        timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+
+def decode_token(token: str, expected_type: str) -> dict:
+    payload = jwt.decode(
+        token,
+        settings.JWT_SECRET_KEY,
+        algorithms=[settings.JWT_ALGORITHM],
+        options={"require": ["sub", "exp", "iat", "jti", "type"]},
+    )
+
+    if payload.get("type") != expected_type:
+        raise jwt.InvalidTokenError("Incorrect token type")
+
+    return payload
+
+
+def decode_access_token(token: str) -> dict:
+    return decode_token(token, "access")
+
+
+def decode_refresh_token(token: str) -> dict:
+    return decode_token(token, "refresh")
+
+========== FILE: app\services\user_service.py ==========
+
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.core.security import hash_password, verify_password
+from app.core.exceptions.custom_exceptions import UserAlreadyExistsException
+from app.models.user import User
+from app.schemas.user import UserCreate, UserLogin
+
+
+def register_user(db: Session, user_data: UserCreate) -> User:
+    email = str(user_data.email).lower()
+
+    existing_user = db.scalar(
+        select(User).where(User.email == email)
+    )
+
+    if existing_user:
+        raise UserAlreadyExistsException()
+
+    user = User(
+        name=user_data.name,
+        email=email,
+        password_hash=hash_password(user_data.password),
+    )
+
+    try:
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    except Exception:
+        db.rollback()
+        raise
+
+    return user
+
+
+def authenticate_user(
+    db: Session,
+    credentials: UserLogin,
+) -> User | None:
+    email = str(credentials.email).lower()
+
+    user = db.scalar(
+        select(User).where(User.email == email)
+    )
+
+    if user is None:
+        return None
+
+    if not verify_password(credentials.password, user.password_hash):
+        return None
+
+    if not user.is_active:
+        return None
+
+    return user
+
+========== FILE: app\api\v1\users.py ==========
+
+
+
+from itsdangerous import BadSignature, SignatureExpired
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPBearer
+from sqlalchemy import select
+from app.dependencies.auth import get_current_user
+from app.dependencies.permissions import require_admin
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.user import User
+from app.models.user_profile import UserProfile
+from app.schemas.user import (
+    UserProfileCreate,
+    UserProfileResponse,
+    UserUpdate,
+    UserMeResponse,
+)
+
+
+router = APIRouter(prefix="/users", tags=["Users"])
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# RBAC: Admin-only test endpoint
+@router.get("/admin/check")
+def admin_check(
+    current_admin: User = Depends(require_admin),
+):
+    return {
+        "message": "Admin access granted",
+        "user_id": current_admin.id,
+        "role": current_admin.role,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+@router.post(
+    "/me/profile",
+    response_model=UserProfileResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_profile(
+    profile_data: UserProfileCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    existing = db.scalar(
+        select(UserProfile).where(
+            UserProfile.user_id == current_user.id
+        )
+    )
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Profile already exists. Use PUT to update it.",
+        )
+
+    profile = UserProfile(
+        user_id=current_user.id,
+        **profile_data.model_dump(),
+    )
+
+    db.add(profile)
+    try:
+        db.commit()
+        db.refresh(profile)
+    except Exception:
+        db.rollback()
+        raise
+
+    return profile
+
+
+@router.get(
+    "/me/profile",
+    response_model=UserProfileResponse,
+)
+def get_profile(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = db.scalar(
+        select(UserProfile).where(
+            UserProfile.user_id == current_user.id
+        )
+    )
+
+    if profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found",
+        )
+
+    return profile
+
+
+@router.put(
+    "/me/profile",
+    response_model=UserProfileResponse,
+)
+def update_profile(
+    profile_data: UserProfileCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = db.scalar(
+        select(UserProfile).where(
+            UserProfile.user_id == current_user.id
+        )
+    )
+
+    if profile is None:
+        profile = UserProfile(
+            user_id=current_user.id,
+            **profile_data.model_dump(),
+        )
+        db.add(profile)
+    else:
+        for field, value in profile_data.model_dump(
+            exclude_unset=True
+        ).items():
+            setattr(profile, field, value)
+
+    try:
+        db.commit()
+        db.refresh(profile)
+    except Exception:
+        db.rollback()
+        raise
+
+    return profile
+
+@router.get("/me", response_model=UserMeResponse)
+def get_my_account(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = db.scalar(
+        select(UserProfile).where(UserProfile.user_id == current_user.id)
+    )
+    return {
+        "id": current_user.id,
+        "name": current_user.name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "is_active": current_user.is_active,
+        "created_at": current_user.created_at,
+        "bio": profile.bio if profile else None,
+        "profile_image_url": profile.profile_picture if profile else None,
+    }
+
+
+@router.put("/me", response_model=UserMeResponse)
+def update_my_account(
+    payload: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide at least one field to update",
+        )
+
+    if "name" in changes:
+        if changes["name"] is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Name cannot be null",
+            )
+        current_user.name = changes["name"]
+
+    profile_fields = {
+        "bio": changes.get("bio"),
+        "profile_picture": changes.get("profile_image_url"),
+    }
+    fields_provided = (
+        "bio" in changes or "profile_image_url" in changes
+    )
+
+    if fields_provided:
+        profile = db.scalar(
+            select(UserProfile).where(
+                UserProfile.user_id == current_user.id
+            )
+        )
+        if profile is None:
+            profile = UserProfile(user_id=current_user.id)
+            db.add(profile)
+
+        if "bio" in changes:
+            profile.bio = profile_fields["bio"]
+        if "profile_image_url" in changes:
+            profile.profile_picture = profile_fields["profile_picture"]
+
+    try:
+        db.commit()
+        db.refresh(current_user)
+    except Exception:
+        db.rollback()
+        raise
+
+    return get_my_account(current_user=current_user, db=db)
+
+========== FILE: app\api\v1\blogs.py ==========
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from app.dependencies.auth import get_current_user
+from app.dependencies.permissions import require_admin
+from app.db.session import get_db
+from app.core.exceptions.custom_exceptions import (
+    BlogNotFoundException,
+    CategoryNotFoundException,
+    ForbiddenException,
+)
+from app.models.blog import Blog
+from app.models.category import Category
+from app.models.user import User
+from app.schemas.blog import (
+    BlogCreate,
+    BlogPublishUpdate,
+    BlogResponse,
+    BlogUpdate,
+)
+
+router = APIRouter(prefix="/blogs", tags=["Blogs"])
+
+
+@router.post("/", response_model=BlogResponse, status_code=status.HTTP_201_CREATED)
+def create_blog(
+    payload: BlogCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    category = db.get(Category, payload.category_id)
+    if category is None:
+        raise CategoryNotFoundException()
+
+    blog = Blog(
+        title=payload.title,
+        content=payload.content,
+        category_id=payload.category_id,
+        author_id=current_user.id,
+        is_published=False,
+    )
+    db.add(blog)
+    db.commit()
+    db.refresh(blog)
+    return blog
+
+
+@router.get("/", response_model=list[BlogResponse])
+def list_blogs(
+    search: str | None = Query(default=None, min_length=1, max_length=200),
+    category_id: int | None = Query(default=None, gt=0),
+    is_published: bool | None = None,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query = select(Blog)
+
+    # Regular users see published blogs and their own drafts.
+    if current_user.role != "admin":
+        query = query.where(
+            or_(
+                Blog.is_published.is_(True),
+                Blog.author_id == current_user.id,
+            )
+        )
+
+    if search:
+        term = f"%{search.strip()}%"
+        query = query.where(
+            or_(Blog.title.ilike(term), Blog.content.ilike(term))
+        )
+
+    if category_id is not None:
+        query = query.where(Blog.category_id == category_id)
+
+    if is_published is not None:
+        query = query.where(Blog.is_published == is_published)
+
+    query = query.order_by(Blog.created_at.desc()).offset(skip).limit(limit)
+    return list(db.scalars(query).all())
+
+
+@router.get("/{blog_id}", response_model=BlogResponse)
+def get_blog(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blog = db.get(Blog, blog_id)
+    if blog is None:
+        raise BlogNotFoundException()
+
+    if (
+        not blog.is_published
+        and current_user.role != "admin"
+        and blog.author_id != current_user.id
+    ):
+        raise ForbiddenException("Access denied")
+
+    return blog
+
+
+@router.patch("/{blog_id}", response_model=BlogResponse)
+def update_blog(
+    blog_id: int,
+    payload: BlogUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    blog = db.get(Blog, blog_id)
+    if blog is None:
+        raise BlogNotFoundException()
+
+    if current_user.role != "admin" and blog.author_id != current_user.id:
+        raise ForbiddenException("You cannot edit this blog")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "category_id" in changes:
+        category = db.get(Category, changes["category_id"])
+        if category is None:
+            raise CategoryNotFoundException()
+
+    for field, value in changes.items():
+        setattr(blog, field, value)
+
+    db.commit()
+    db.refresh(blog)
+    return blog
+
+
+@router.patch("/{blog_id}/publish", response_model=BlogResponse)
+def set_blog_published(
+    blog_id: int,
+    payload: BlogPublishUpdate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    blog = db.get(Blog, blog_id)
+    if blog is None:
+        raise BlogNotFoundException()
+
+    blog.is_published = payload.is_published
+    db.commit()
+    db.refresh(blog)
+    return blog
+
+
+@router.delete("/{blog_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_blog(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    blog = db.get(Blog, blog_id)
+    if blog is None:
+        raise BlogNotFoundException()
+
+    db.delete(blog)
+    db.commit()
+
+========== FILE: app\api\v1\comments.py ==========
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.dependencies.auth import get_current_user
+from app.db.session import get_db
+from app.models.blog import Blog
+from app.core.exceptions.custom_exceptions import BlogNotFoundException, CommentNotFoundException, ForbiddenException
+from app.models.comment import Comment
+from app.models.user import User
+from app.schemas.comment import (
+    CommentCreate,
+    CommentUpdate,
+    CommentResponse,
+)
+
+router = APIRouter(prefix="/blogs", tags=["Comments"])
+
+
+def get_published_blog(blog_id: int, db: Session) -> Blog:
+    blog = db.get(Blog, blog_id)
+
+    if blog is None:
+        raise BlogNotFoundException()
+
+    if not blog.is_published:
+        raise HTTPException(
+            status_code=400,
+            detail="Comments are allowed only on published blogs",
+        )
+
+    return blog
+
+
+@router.post(
+    "/{blog_id}/comments",
+    response_model=CommentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_comment(
+    blog_id: int,
+    payload: CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_published_blog(blog_id, db)
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(
+            status_code=422,
+            detail="Comment content cannot be empty",
+        )
+
+    comment = Comment(
+        blog_id=blog_id,
+        user_id=current_user.id,
+        content=content,
+    )
+
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return comment
+
+
+@router.get(
+    "/{blog_id}/comments",
+    response_model=list[CommentResponse],
+)
+def list_comments(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_published_blog(blog_id, db)
+
+    query = (
+        select(Comment)
+        .where(Comment.blog_id == blog_id)
+        .order_by(Comment.created_at.desc(), Comment.id.desc())
+    )
+
+    return list(db.scalars(query).all())
+
+
+@router.put(
+    "/{blog_id}/comments/{comment_id}",
+    response_model=CommentResponse,
+)
+def update_comment(
+    blog_id: int,
+    comment_id: int,
+    payload: CommentUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_published_blog(blog_id, db)
+
+    comment = db.get(Comment, comment_id)
+
+    if comment is None or comment.blog_id != blog_id:
+        raise CommentNotFoundException()
+
+    if comment.user_id != current_user.id:
+        raise ForbiddenException("You cannot edit another user comment")
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(
+            status_code=422,
+            detail="Comment content cannot be empty",
+        )
+
+    comment.content = content
+    db.commit()
+    db.refresh(comment)
+    return comment
+
+
+@router.delete(
+    "/{blog_id}/comments/{comment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_comment(
+    blog_id: int,
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    comment = db.get(Comment, comment_id)
+
+    if comment is None or comment.blog_id != blog_id:
+        raise CommentNotFoundException()
+
+    if current_user.role != "admin" and comment.user_id != current_user.id:
+        raise ForbiddenException("You cannot delete another user comment")
+
+    db.delete(comment)
+    db.commit()
+
+========== FILE: app\api\v1\ratings.py ==========
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.dependencies.auth import get_current_user
+from app.db.session import get_db
+from app.models.blog import Blog
+from app.core.exceptions.custom_exceptions import BlogNotFoundException, ResourceNotFoundException, ResourceConflictException
+from app.models.rating import Rating
+from app.models.user import User
+from app.schemas.rating import (
+    RatingCreate,
+    RatingUpdate,
+    RatingResponse,
+    RatingSummary,
+)
+
+router = APIRouter(prefix="/blogs", tags=["Ratings"])
+
+
+def get_published_blog(blog_id: int, db: Session) -> Blog:
+    blog = db.get(Blog, blog_id)
+
+    if blog is None:
+        raise BlogNotFoundException()
+
+    if not blog.is_published:
+        raise HTTPException(
+            status_code=400,
+            detail="Ratings are allowed only on published blogs",
+        )
+
+    return blog
+
+
+@router.post(
+    "/{blog_id}/ratings",
+    response_model=RatingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_rating(
+    blog_id: int,
+    payload: RatingCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_published_blog(blog_id, db)
+
+    existing = db.scalar(
+        select(Rating).where(
+            Rating.blog_id == blog_id,
+            Rating.user_id == current_user.id,
+        )
+    )
+
+    if existing:
+        raise ResourceConflictException("You have already rated this blog; update your rating instead", "RATING_ALREADY_EXISTS")
+
+    rating = Rating(
+        blog_id=blog_id,
+        user_id=current_user.id,
+        value=payload.value,
+    )
+    db.add(rating)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ResourceConflictException("You have already rated this blog", "RATING_ALREADY_EXISTS")
+
+    db.refresh(rating)
+    return rating
+
+
+@router.get(
+    "/{blog_id}/ratings/summary",
+    response_model=RatingSummary,
+)
+def rating_summary(
+    blog_id: int,
+    db: Session = Depends(get_db),
+):
+    get_published_blog(blog_id, db)
+
+    average, total = db.execute(
+        select(func.avg(Rating.value), func.count(Rating.id)).where(
+            Rating.blog_id == blog_id
+        )
+    ).one()
+
+    return {
+        "blog_id": blog_id,
+        "average_rating": round(float(average), 2) if average is not None else None,
+        "total_ratings": total,
+    }
+
+
+@router.get(
+    "/{blog_id}/ratings/me",
+    response_model=RatingResponse,
+)
+def my_rating(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_published_blog(blog_id, db)
+
+    rating = db.scalar(
+        select(Rating).where(
+            Rating.blog_id == blog_id,
+            Rating.user_id == current_user.id,
+        )
+    )
+
+    if rating is None:
+        raise ResourceNotFoundException("You have not rated this blog", "RATING_NOT_FOUND")
+
+    return rating
+
+
+@router.put(
+    "/{blog_id}/ratings/me",
+    response_model=RatingResponse,
+)
+def update_my_rating(
+    blog_id: int,
+    payload: RatingUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    get_published_blog(blog_id, db)
+
+    rating = db.scalar(
+        select(Rating).where(
+            Rating.blog_id == blog_id,
+            Rating.user_id == current_user.id,
+        )
+    )
+
+    if rating is None:
+        raise ResourceNotFoundException("You have not rated this blog", "RATING_NOT_FOUND")
+
+    rating.value = payload.value
+    db.commit()
+    db.refresh(rating)
+    return rating
+
+
+@router.delete(
+    "/{blog_id}/ratings/me",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_my_rating(
+    blog_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rating = db.scalar(
+        select(Rating).where(
+            Rating.blog_id == blog_id,
+            Rating.user_id == current_user.id,
+        )
+    )
+
+    if rating is None:
+        raise ResourceNotFoundException("You have not rated this blog", "RATING_NOT_FOUND")
+
+    db.delete(rating)
+    db.commit()

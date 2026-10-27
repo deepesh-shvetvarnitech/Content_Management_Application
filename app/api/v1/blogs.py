@@ -1,17 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_, select
+
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
+from app.db.session import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.permissions import require_admin
-from app.db.session import get_db
-from app.core.exceptions.custom_exceptions import (
-    BlogNotFoundException,
-    CategoryNotFoundException,
-    ForbiddenException,
-)
-from app.models.blog import Blog
-from app.models.category import Category
 from app.models.user import User
 from app.schemas.blog import (
     BlogCreate,
@@ -19,31 +12,29 @@ from app.schemas.blog import (
     BlogResponse,
     BlogUpdate,
 )
+from app.services.blog_service import (
+    create_blog as create_blog_service,
+    list_blogs as list_blogs_service,
+    get_blog as get_blog_service,
+    update_blog as update_blog_service,
+    set_blog_published as set_blog_published_service,
+    delete_blog as delete_blog_service,
+)
 
 router = APIRouter(prefix="/blogs", tags=["Blogs"])
 
 
-@router.post("/", response_model=BlogResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=BlogResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def create_blog(
     payload: BlogCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    category = db.get(Category, payload.category_id)
-    if category is None:
-        raise CategoryNotFoundException()
-
-    blog = Blog(
-        title=payload.title,
-        content=payload.content,
-        category_id=payload.category_id,
-        author_id=current_user.id,
-        is_published=False,
-    )
-    db.add(blog)
-    db.commit()
-    db.refresh(blog)
-    return blog
+    return create_blog_service(db, payload, current_user)
 
 
 @router.get("/", response_model=list[BlogResponse])
@@ -56,31 +47,15 @@ def list_blogs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = select(Blog)
-
-    # Regular users see published blogs and their own drafts.
-    if current_user.role != "admin":
-        query = query.where(
-            or_(
-                Blog.is_published.is_(True),
-                Blog.author_id == current_user.id,
-            )
-        )
-
-    if search:
-        term = f"%{search.strip()}%"
-        query = query.where(
-            or_(Blog.title.ilike(term), Blog.content.ilike(term))
-        )
-
-    if category_id is not None:
-        query = query.where(Blog.category_id == category_id)
-
-    if is_published is not None:
-        query = query.where(Blog.is_published == is_published)
-
-    query = query.order_by(Blog.created_at.desc()).offset(skip).limit(limit)
-    return list(db.scalars(query).all())
+    return list_blogs_service(
+        db=db,
+        current_user=current_user,
+        search=search,
+        category_id=category_id,
+        is_published=is_published,
+        skip=skip,
+        limit=limit,
+    )
 
 
 @router.get("/{blog_id}", response_model=BlogResponse)
@@ -89,18 +64,7 @@ def get_blog(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    blog = db.get(Blog, blog_id)
-    if blog is None:
-        raise BlogNotFoundException()
-
-    if (
-        not blog.is_published
-        and current_user.role != "admin"
-        and blog.author_id != current_user.id
-    ):
-        raise ForbiddenException("Access denied")
-
-    return blog
+    return get_blog_service(db, blog_id, current_user)
 
 
 @router.patch("/{blog_id}", response_model=BlogResponse)
@@ -110,25 +74,7 @@ def update_blog(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    blog = db.get(Blog, blog_id)
-    if blog is None:
-        raise BlogNotFoundException()
-
-    if current_user.role != "admin" and blog.author_id != current_user.id:
-        raise ForbiddenException("You cannot edit this blog")
-
-    changes = payload.model_dump(exclude_unset=True)
-    if "category_id" in changes:
-        category = db.get(Category, changes["category_id"])
-        if category is None:
-            raise CategoryNotFoundException()
-
-    for field, value in changes.items():
-        setattr(blog, field, value)
-
-    db.commit()
-    db.refresh(blog)
-    return blog
+    return update_blog_service(db, blog_id, payload, current_user)
 
 
 @router.patch("/{blog_id}/publish", response_model=BlogResponse)
@@ -138,14 +84,7 @@ def set_blog_published(
     db: Session = Depends(get_db),
     current_admin: User = Depends(require_admin),
 ):
-    blog = db.get(Blog, blog_id)
-    if blog is None:
-        raise BlogNotFoundException()
-
-    blog.is_published = payload.is_published
-    db.commit()
-    db.refresh(blog)
-    return blog
+    return set_blog_published_service(db, blog_id, payload)
 
 
 @router.delete("/{blog_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -154,9 +93,4 @@ def delete_blog(
     db: Session = Depends(get_db),
     current_admin: User = Depends(require_admin),
 ):
-    blog = db.get(Blog, blog_id)
-    if blog is None:
-        raise BlogNotFoundException()
-
-    db.delete(blog)
-    db.commit()
+    delete_blog_service(db, blog_id)

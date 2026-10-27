@@ -1,11 +1,18 @@
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.dependencies.permissions import require_admin
 from app.models.user import User
 from app.schemas.user import AdminUserResponse
+
+from app.services.admin_service import (
+    list_users as list_users_service,
+    get_user as get_user_service,
+    activate_user as activate_user_service,
+    deactivate_user as deactivate_user_service,
+)
 
 router = APIRouter(
     prefix="/admin/users",
@@ -18,7 +25,7 @@ def list_users(
     current_admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return db.scalars(select(User).order_by(User.id)).all()
+    return list_users_service(db)
 
 
 @router.get("/{user_id}", response_model=AdminUserResponse)
@@ -27,13 +34,7 @@ def get_user(
     current_admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-    return user
+    return get_user_service(db, user_id)
 
 
 @router.patch("/{user_id}/activate", response_model=AdminUserResponse)
@@ -42,17 +43,7 @@ def activate_user(
     current_admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    user.is_active = True
-    db.commit()
-    db.refresh(user)
-    return user
+    return activate_user_service(db, user_id)
 
 
 @router.patch("/{user_id}/deactivate", response_model=AdminUserResponse)
@@ -61,20 +52,12 @@ def deactivate_user(
     current_admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    if user.id == current_admin.id:
+    # Admin apne hi account ko deactivate nahi kar sakta.
+    if user_id == current_admin.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Admins cannot deactivate their own account",
         )
 
-    user.is_active = False
-    db.commit()
-    db.refresh(user)
-    return user
+    return deactivate_user_service(db, user_id)
+

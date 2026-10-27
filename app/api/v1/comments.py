@@ -1,35 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+
+
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from app.dependencies.auth import get_current_user
 from app.db.session import get_db
-from app.models.blog import Blog
-from app.core.exceptions.custom_exceptions import BlogNotFoundException, CommentNotFoundException, ForbiddenException
-from app.models.comment import Comment
+from app.dependencies.auth import get_current_user
 from app.models.user import User
-from app.schemas.comment import (
-    CommentCreate,
-    CommentUpdate,
-    CommentResponse,
+from app.schemas.comment import CommentCreate, CommentUpdate, CommentResponse
+from app.services.comment_service import (
+    create_comment as create_comment_service,
+    list_comments as list_comments_service,
+    update_comment as update_comment_service,
+    delete_comment as delete_comment_service,
 )
 
 router = APIRouter(prefix="/blogs", tags=["Comments"])
-
-
-def get_published_blog(blog_id: int, db: Session) -> Blog:
-    blog = db.get(Blog, blog_id)
-
-    if blog is None:
-        raise BlogNotFoundException()
-
-    if not blog.is_published:
-        raise HTTPException(
-            status_code=400,
-            detail="Comments are allowed only on published blogs",
-        )
-
-    return blog
 
 
 @router.post(
@@ -43,25 +28,7 @@ def create_comment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    get_published_blog(blog_id, db)
-
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(
-            status_code=422,
-            detail="Comment content cannot be empty",
-        )
-
-    comment = Comment(
-        blog_id=blog_id,
-        user_id=current_user.id,
-        content=content,
-    )
-
-    db.add(comment)
-    db.commit()
-    db.refresh(comment)
-    return comment
+    return create_comment_service(db, blog_id, payload, current_user)
 
 
 @router.get(
@@ -73,15 +40,7 @@ def list_comments(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    get_published_blog(blog_id, db)
-
-    query = (
-        select(Comment)
-        .where(Comment.blog_id == blog_id)
-        .order_by(Comment.created_at.desc(), Comment.id.desc())
-    )
-
-    return list(db.scalars(query).all())
+    return list_comments_service(db, blog_id)
 
 
 @router.put(
@@ -95,27 +54,9 @@ def update_comment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    get_published_blog(blog_id, db)
-
-    comment = db.get(Comment, comment_id)
-
-    if comment is None or comment.blog_id != blog_id:
-        raise CommentNotFoundException()
-
-    if comment.user_id != current_user.id:
-        raise ForbiddenException("You cannot edit another user comment")
-
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(
-            status_code=422,
-            detail="Comment content cannot be empty",
-        )
-
-    comment.content = content
-    db.commit()
-    db.refresh(comment)
-    return comment
+    return update_comment_service(
+        db, blog_id, comment_id, payload, current_user
+    )
 
 
 @router.delete(
@@ -128,13 +69,4 @@ def delete_comment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    comment = db.get(Comment, comment_id)
-
-    if comment is None or comment.blog_id != blog_id:
-        raise CommentNotFoundException()
-
-    if current_user.role != "admin" and comment.user_id != current_user.id:
-        raise ForbiddenException("You cannot delete another user comment")
-
-    db.delete(comment)
-    db.commit()
+    delete_comment_service(db, blog_id, comment_id, current_user)
